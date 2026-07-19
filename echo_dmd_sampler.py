@@ -9,19 +9,22 @@ Two nodes:
                       a fully custom comma-separated list.  Handles the
                       two-zone structure (init cluster + DMD anchor points).
   • EchoDMDSampler  — outputs a SAMPLER that runs a pure deterministic euler
-                      loop (no ancestral noise injection).  Optionally skips
-                      the uncond pass (cfg=1.0 fast path) and supports
-                      sigma-threshold gating of the init zone.
+                      loop (no ancestral noise injection).  Supports sigma
+                      remapping to keep model conditioning on trained anchor
+                      values when using extended refinement schedules.
 
 Add to your NODE_CLASS_MAPPINGS / NODE_DISPLAY_NAME_MAPPINGS as usual.
 """
 
 from __future__ import annotations
 
+import time
 import torch
+from tqdm.auto import tqdm
 import comfy.samplers
 import comfy.sample
 import comfy.model_patcher
+import comfy.utils
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,13 +53,95 @@ SIGMAS_MINIMAL = [
     0.909375, 0.817, 0.725, 0.421875, 0.0
 ]
 
+
+# Extended refinement presets — target the two large low-sigma gaps
+# (0.725→0.422 and 0.422→0.0) where fine-motion ghosting originates.
+# All DMD anchor points are preserved in every variant.
+
+# 10 steps: minimal fix — one substep before terminal only.
+# Splits the 0.422→0.0 gap. Lowest risk, try first.
+SIGMAS_10STEP = [
+    1.0, 0.99375, 0.9875, 0.98125, 0.975,
+    0.909375, 0.725, 0.421875, 0.14, 0.0
+]
+
+# 11 steps: drops one init step, adds 0.573 in the coarse-detail gap
+# and 0.21 before terminal. Addresses both large low-sigma gaps.
+SIGMAS_11STEP = [
+    1.0, 0.99375, 0.9875, 0.975,
+    0.909375, 0.725, 0.573, 0.421875, 0.21, 0.0
+]
+
+# 12 steps: bridge + full low-sigma coverage. Most complete refinement.
+# Adds 0.817 (bridge), 0.573 (mid coarse-detail), 0.21 and 0.07
+# (fine-detail substeps). Recommended if 10/11 step doesn't clear ghosting.
+SIGMAS_12STEP = [
+    1.0, 0.99375, 0.975,
+    0.909375, 0.817, 0.725, 0.573, 0.421875, 0.21, 0.07, 0.0
+]
+
 PRESET_MAP = {
-    "official":  SIGMAS_OFFICIAL,
-    "bridge":    SIGMAS_BRIDGE,
-    "minimal":   SIGMAS_MINIMAL,
+    "official": SIGMAS_OFFICIAL,
+    "bridge":   SIGMAS_BRIDGE,
+    "minimal":  SIGMAS_MINIMAL,
+    "10step":   SIGMAS_10STEP,
+    "11step":   SIGMAS_11STEP,
+    "12step":   SIGMAS_12STEP,
 }
 
 ANCHOR_SIGMAS = {0.975, 0.909375, 0.725, 0.421875, 0.0}
+
+# All 9 official DMD anchor sigmas as a tensor — used for sigma remapping.
+# The model's adaln timestep embedder was trained on exactly these values.
+# When using non-standard sigma schedules, remap_sigma() maps arbitrary
+# denoising sigmas to these anchors for model conditioning, while the
+# euler step still uses the actual sigma value.
+DMD_ANCHORS = torch.tensor(
+    [1.0, 0.99375, 0.9875, 0.98125, 0.975,
+     0.909375, 0.725, 0.421875, 0.0],
+    dtype=torch.float32,
+)
+
+
+def remap_sigma(sigma: float, method: str) -> float:
+    """
+    Map a denoising sigma to an effective sigma for model timestep conditioning.
+
+    Decouples the euler-step sigma from the conditioning sigma so non-official
+    schedules (bridge/minimal/10step/11step/12step/custom) still receive
+    well-formed timestep embeddings the model was trained on.
+
+    none          Pass sigma through unchanged.  Use with the official preset
+                  or when testing schedules very close to the anchor values.
+
+    interpolate   Linear interpolation between the two bounding DMD anchors.
+                  Smooth embeddings.  Recommended for all extended presets.
+
+    nearest       Hard snap to the closest DMD anchor.  Guarantees a seen
+                  training embedding but can produce slight staircase artefacts
+                  at anchor boundaries.
+    """
+    if method == "none":
+        return sigma
+
+    anchors = DMD_ANCHORS
+    if method == "nearest":
+        idx = int((anchors - sigma).abs().argmin().item())
+        return float(anchors[idx].item())
+
+    # interpolate: find the two anchors bracketing sigma
+    above = anchors[anchors >= sigma]
+    below = anchors[anchors <= sigma]
+    if len(above) == 0:
+        return float(anchors[0].item())
+    if len(below) == 0:
+        return float(anchors[-1].item())
+    s_hi = float(above[-1].item())
+    s_lo = float(below[0].item())
+    if s_hi == s_lo:
+        return s_hi
+    t = (sigma - s_lo) / (s_hi - s_lo)
+    return s_lo + t * (s_hi - s_lo)
 
 
 def parse_sigma_string(s: str) -> list[float]:
@@ -100,7 +185,7 @@ class EchoDMDSigmas:
         return {
             "required": {
                 "preset": (
-                    ["official", "bridge", "minimal", "custom"],
+                    ["official", "bridge", "minimal", "10step", "11step", "12step", "custom"],
                     {"default": "official"},
                 ),
                 "custom_sigmas": (
@@ -192,22 +277,45 @@ def _sample_echo_dmd(
     extra_args = extra_args or {}
     s_in = x.new_ones([x.shape[0]])
 
-    for i in range(len(sigmas) - 1):
-        sigma      = sigmas[i].item()
-        sigma_next = sigmas[i + 1].item()
+    steps = len(sigmas) - 1
+    pbar = comfy.utils.ProgressBar(steps)
+    pbar_tqdm = tqdm(
+        total=steps,
+        leave=True,
+        disable=disable,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+    )
 
-        denoised = model(x, sigma * s_in, **extra_args)
+    try:
+        for i in range(steps):
+            sigma      = sigmas[i].item()
+            sigma_next = sigmas[i + 1].item()
 
-        if callback is not None:
-            callback({
-                "x":         x,
-                "i":         i,
-                "sigma":     sigmas[i],
-                "sigma_hat": sigmas[i],
-                "denoised":  denoised,
-            })
+            t0 = time.perf_counter()
+            denoised = model(x, sigma * s_in, **extra_args)
+            if x.is_cuda:
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
 
-        x = _euler_dmd_step(x, sigma, sigma_next, denoised)
+            if callback is not None:
+                callback({
+                    "x":         x,
+                    "i":         i,
+                    "sigma":     sigmas[i],
+                    "sigma_hat": sigmas[i],
+                    "denoised":  denoised,
+                })
+
+            x = _euler_dmd_step(x, sigma, sigma_next, denoised)
+
+            pbar_tqdm.update(1)
+            if elapsed >= 1.0:
+                pbar_tqdm.set_postfix({"s/it": f"{elapsed:.2f}"})
+            else:
+                pbar_tqdm.set_postfix({"it/s": f"{1.0 / elapsed:.2f}"})
+            pbar.update(1)
+    finally:
+        pbar_tqdm.close()
 
     return x
 
@@ -251,16 +359,88 @@ class EchoDMDSampler:
         return (sampler,)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EchoDMDSigmaRemap node
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EchoDMDSigmaRemap:
+    """
+    Remaps a SIGMAS tensor so every value is expressed in terms of the
+    DMD anchor sigma space before it reaches either the guider or the sampler.
+
+    Why this is a separate node:
+        The STG guider and the sampler both receive the same SIGMAS tensor.
+        If remapping happened inside the sampler, the guider would see the
+        raw schedule (e.g. 0.817) while the sampler conditions on the
+        interpolated anchor value — a mismatch that misaligns CFG weighting
+        with denoising conditioning.  Remapping upstream ensures both nodes
+        operate on consistent effective timesteps.
+
+    Modes
+    ─────
+    interpolate   Each sigma is linearly interpolated between its two
+                  bounding DMD anchor values.  Smooth conditioning.
+                  Recommended for bridge / minimal / extended presets.
+
+    nearest       Each sigma snaps to the closest DMD anchor.  Hard
+                  quantisation — guarantees a seen training embedding
+                  but can introduce slight staircase artefacts.
+
+    none          Pass sigmas through unchanged.  Use with the official
+                  preset or when sigma values are already at DMD anchors.
+
+    The remapped tensor is used for model conditioning only.  If you need
+    the original values for reference (e.g. logging), keep the pre-remap
+    SIGMAS connected separately.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sigmas": ("SIGMAS",),
+                "method": (
+                    ["interpolate", "nearest", "none"],
+                    {
+                        "default": "interpolate",
+                        "tooltip": (
+                            "interpolate: smooth linear blend between bounding "
+                            "DMD anchors.  nearest: snap to closest anchor.  "
+                            "none: pass through unchanged."
+                        ),
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES  = ("SIGMAS",)
+    RETURN_NAMES  = ("sigmas",)
+    FUNCTION      = "remap"
+    CATEGORY      = "10S Nodes/Sampling"
+
+    def remap(self, sigmas: torch.Tensor, method: str):
+        if method == "none":
+            return (sigmas,)
+        remapped = torch.tensor(
+            [remap_sigma(float(s.item()), method) for s in sigmas],
+            dtype=sigmas.dtype,
+            device=sigmas.device,
+        )
+        return (remapped,)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Registration
 # ─────────────────────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
-    "EchoDMDSigmas":  EchoDMDSigmas,
-    "EchoDMDSampler": EchoDMDSampler,
+    "EchoDMDSigmas":      EchoDMDSigmas,
+    "EchoDMDSigmaRemap":  EchoDMDSigmaRemap,
+    "EchoDMDSampler":     EchoDMDSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "EchoDMDSigmas":  "\U0001f300 Echo DMD Sigmas",
-    "EchoDMDSampler": "\U0001f300 Echo DMD Sampler",
+    "EchoDMDSigmas":      "\U0001f300 Echo DMD Sigmas",
+    "EchoDMDSigmaRemap":  "\U0001f300 Echo DMD Sigma Remap",
+    "EchoDMDSampler":     "\U0001f300 Echo DMD Sampler",
 }

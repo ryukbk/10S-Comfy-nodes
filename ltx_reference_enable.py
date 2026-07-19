@@ -68,6 +68,121 @@ def _import_comfy():
     return av_module, model_module, latent_to_pixel_coords
 
 
+# ── v2: Best-Face-ID source phase rotation ─────────────────────────────────
+
+_ORIGINAL_PREPARE_PE = None
+
+
+def _compose_source_phase(cos_orig, sin_orig, ref_len, source_id, phase_scale, theta=10000.0):
+    """
+    Apply Best-Face-ID's source phase rotation to reference token positions only.
+
+    Per creator's spec:
+      rate(d) = theta ** (-2d / L)                     (per rotary dim d, L=D_head)
+      extra_angle(d) = source_id * phase_scale * rate(d)
+      cos_new = cos_orig * cos_extra - sin_orig * sin_extra
+      sin_new = cos_orig * sin_extra + sin_orig * cos_extra
+    Only for ref positions along T axis; target positions untouched.
+
+    cos_orig, sin_orig: (B, H, T, D_head)
+    """
+    if ref_len <= 0 or source_id == 0.0 or phase_scale == 0.0:
+        return cos_orig, sin_orig
+
+    B, H, T, D = cos_orig.shape
+    device = cos_orig.device
+    dtype  = cos_orig.dtype
+    if ref_len > T:
+        ref_len = T
+
+    # Frequency schedule matching RoPE convention.
+    # Interleaved RoPE pairs adjacent dims (2i, 2i+1) sharing a rate.
+    n_pairs = D // 2
+    pair_idx = torch.arange(n_pairs, device=device, dtype=torch.float32)
+    rate_per_pair = theta ** (-2.0 * pair_idx / D)
+    rate = rate_per_pair.repeat_interleave(2)
+    if D % 2 == 1:
+        rate = torch.cat([rate, rate_per_pair[-1:].expand(1)], dim=0)
+
+    extra_angle = source_id * phase_scale * rate
+    cos_extra = extra_angle.cos().to(dtype=dtype).view(1, 1, 1, D)
+    sin_extra = extra_angle.sin().to(dtype=dtype).view(1, 1, 1, D)
+
+    cos_ref = cos_orig[:, :, :ref_len, :]
+    sin_ref = sin_orig[:, :, :ref_len, :]
+
+    cos_new_ref = cos_ref * cos_extra - sin_ref * sin_extra
+    sin_new_ref = cos_ref * sin_extra + sin_ref * cos_extra
+
+    cos_out = cos_orig.clone()
+    sin_out = sin_orig.clone()
+    cos_out[:, :, :ref_len, :] = cos_new_ref
+    sin_out[:, :, :ref_len, :] = sin_new_ref
+
+    return cos_out, sin_out
+
+
+def _apply_source_phase_to_pe(pe, ref_len, source_id, phase_scale, theta=10000.0):
+    """
+    Walk pe structure and apply _compose_source_phase to self-attn frequencies
+    only (pe[0]).  Cross-attn (pe[1]) untouched.
+
+    Expected structure:
+      pe = [
+          ( (cos, sin, split), (cos, sin, split) ),   # pe[0] self-attn split halves
+          ( (cos, sin, split), ... ),                  # pe[1] cross-attn (context)
+      ]
+    """
+    if ref_len <= 0 or source_id == 0.0 or phase_scale == 0.0:
+        return pe
+    if not (isinstance(pe, (list, tuple)) and len(pe) >= 1):
+        return pe
+
+    self_attn_freqs = pe[0]
+    if not isinstance(self_attn_freqs, (list, tuple)):
+        return pe
+
+    new_self_attn = []
+    for freq_tuple in self_attn_freqs:
+        if not isinstance(freq_tuple, tuple) or len(freq_tuple) < 2:
+            new_self_attn.append(freq_tuple)
+            continue
+        cos_orig, sin_orig = freq_tuple[0], freq_tuple[1]
+        extras = freq_tuple[2:] if len(freq_tuple) > 2 else ()
+        if not (hasattr(cos_orig, "shape") and cos_orig.dim() == 4):
+            new_self_attn.append(freq_tuple)
+            continue
+        cos_new, sin_new = _compose_source_phase(
+            cos_orig, sin_orig, ref_len, source_id, phase_scale, theta
+        )
+        new_self_attn.append((cos_new, sin_new, *extras))
+
+    new_self_attn = tuple(new_self_attn)
+    if isinstance(pe, list):
+        new_pe = [new_self_attn] + list(pe[1:])
+    else:
+        new_pe = (new_self_attn,) + tuple(pe[1:])
+    return new_pe
+
+
+def _patched_prepare_positional_embeddings(self, pixel_coords, frame_rate, x_dtype):
+    """v2: wrap standard pe construction with reference-token phase rotation."""
+    global _ORIGINAL_PREPARE_PE
+    pe = _ORIGINAL_PREPARE_PE(self, pixel_coords, frame_rate, x_dtype)
+
+    ref_len     = int(getattr(self, "_pending_ref_seq_len", 0) or 0)
+    source_id   = float(getattr(self, "_pending_source_id", 0.0) or 0.0)
+    phase_scale = float(getattr(self, "_pending_phase_scale", 0.0) or 0.0)
+    theta       = float(getattr(self, "positional_embedding_theta", 10000.0) or 10000.0)
+
+    if ref_len > 0 and source_id != 0.0 and phase_scale != 0.0:
+        pe = _apply_source_phase_to_pe(pe, ref_len, source_id, phase_scale, theta)
+        _log(f"v2 source phase applied: ref_len={ref_len} "
+             f"source_id={source_id} phase_scale={phase_scale} theta={theta}")
+
+    return pe
+
+
 def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
     """Patched LTXAVModel._process_input — injects reference tokens."""
     global _CALL_COUNTER
@@ -101,11 +216,32 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
             or transformer_options.get("memory_position_mode") \
             or "reference"
 
+    # NEW (v1.1): source_id and phase_scale for RoPE source-phase tagging.
+    # Best-Face-ID LoRA expects source_id=2, phase_scale=1.0.
+    # Read from kwargs first, then nested transformer_options.
+    source_id = kwargs.get("reference_source_id")
+    if source_id is None and isinstance(transformer_options, dict):
+        source_id = transformer_options.get("reference_source_id")
+    if source_id is None:
+        source_id = 0.0
+    source_id = float(source_id)
+
+    phase_scale = kwargs.get("reference_phase_scale")
+    if phase_scale is None and isinstance(transformer_options, dict):
+        phase_scale = transformer_options.get("reference_phase_scale")
+    if phase_scale is None:
+        phase_scale = 1.0
+    phase_scale = float(phase_scale)
+
     # Always run the original first
     result = _ORIGINAL_PROCESS_INPUT(self, x, keyframe_idxs, denoise_mask, **kwargs)
     tokens_list, coords_list, additional_args = result
 
     self._pending_ref_seq_len = 0
+    self._pending_source_id = 0.0
+    self._pending_phase_scale = 0.0
+    self._pending_source_id = 0.0
+    self._pending_phase_scale = 0.0
 
     if reference_latent is None:
         return result
@@ -183,14 +319,39 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
         _log(f"pixel coords failed: {type(e).__name__}: {e}")
         return result
 
-    # Optional: shift positions for prefix_continuous mode
-    if position_mode == "prefix_continuous":
+    # Position handling — v1 uses pure "overlap" layout (Best-Face-ID default).
+    #
+    # Per Best-Face-ID creator: reference tokens sit at IDENTICAL raw T/H/W
+    # coordinates as the target ("overlap" layout — what the trained LoRA
+    # expects).  Disambiguation between reference and target comes from:
+    #   1. denoise_mask=0 on reference tokens (always clean, never noised)
+    #   2. Sequence position (reference concatenated before target)
+    #   3. A per-dimension phase rotation added on top of RoPE (NOT YET
+    #      IMPLEMENTED in v1 — this is the piece that requires hooking into
+    #      the RoPE application inside attention modules)
+    #
+    # Without the phase rotation, when both reference and target are clean
+    # at the same coordinate near the end of denoising, attention has no
+    # positional signal to distinguish them.  v1 relies on sequence-position
+    # and clean/noisy state as the sole disambiguation.  Works well early
+    # in sampling; may show some identity blending late in sampling.
+    #
+    # Legacy 'prefix' mode retained for backward compatibility with earlier
+    # workflows that expected additive positioning.
+    if position_mode == "prefix_continuous" or position_mode == "prefix":
         try:
             ref_temporal_end = float(ref_pixel_coords[:, 0, :, 1].max().item())
             ref_pixel_coords = ref_pixel_coords.clone()
             ref_pixel_coords[:, 0, :, :] -= ref_temporal_end
+            _log(f"prefix mode: shifted reference to precede target")
         except Exception as e:
-            _log(f"prefix_continuous offset failed: {type(e).__name__}: {e}")
+            _log(f"prefix offset failed: {type(e).__name__}: {e}")
+    else:
+        # overlap / i2v_safe / t2v_overlap / reference — all use pure overlap.
+        # No coordinate changes.  Reference reuses target's coord grid.
+        _log(f"overlap layout: reference at same coords as target "
+             f"(source_id={source_id}, phase_scale={phase_scale} — "
+             f"phase rotation deferred to v2 attention-level hook)")
 
     # Apply patchify_proj
     try:
@@ -234,7 +395,11 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
     additional_args["target_seq_len"] = target_seq_len
     additional_args["target_frames"] = target_frames
     self._pending_ref_seq_len = ref_seq_len
+    self._pending_source_id = source_id
+    self._pending_phase_scale = phase_scale
     self._pending_ref_frames = ref_frames
+    self._pending_source_id = source_id
+    self._pending_phase_scale = phase_scale
 
     _log(f"Prepending {ref_seq_len} ref tokens "
          f"(target was {target_seq_len}, now {vx_combined.shape[1]}, "
@@ -557,6 +722,20 @@ def apply_global_patches():
 
         LTXAVModel._process_input = _patched_process_input
         LTXAVModel._prepare_timestep = _patched_prepare_timestep
+
+        # v2: wrap _prepare_positional_embeddings on whichever base class owns it
+        global _ORIGINAL_PREPARE_PE
+        _pe_owner = None
+        for cls in LTXAVModel.__mro__:
+            if '_prepare_positional_embeddings' in cls.__dict__:
+                _pe_owner = cls
+                break
+        if _pe_owner is not None:
+            _ORIGINAL_PREPARE_PE = _pe_owner._prepare_positional_embeddings
+            _pe_owner._prepare_positional_embeddings = _patched_prepare_positional_embeddings
+            print(f"[LTX Ref] v2 patched _prepare_positional_embeddings on {_pe_owner.__name__}")
+        else:
+            print("[LTX Ref] ⚠ could not find _prepare_positional_embeddings owner")
 
         _PATCHES_APPLIED = True
         _PATCH_ERROR = None

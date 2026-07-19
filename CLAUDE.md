@@ -69,6 +69,41 @@
 ### 🔍 LTX Model Inspector
 - **Diagnostic node** for inspecting LTX2 module structure. Used during node development.
 
+### 🧑 LTX Face Identity Reinforcer
+- **File:** `ltx_face_identity_reinforcer.py`
+- **Class:** `LTXFaceIdentityReinforcer`
+- **Category:** `10S Nodes/Identity`
+- **Role:** single-node identity reinforcer implementing the full [LTX-Best-Face-ID](https://huggingface.co/Alissonerdx/LTX-Best-Face-ID) mechanism for i2v workflows. Best-Face-ID LoRA was originally T2V-only because its reference-latent injection at frame 0 conflicted with i2v's frame 0 latent conditioning. This node resolves the conflict.
+- **Mechanism (per creator's spec):**
+    1. **Overlap coordinate layout** — reference tokens sit at IDENTICAL raw T/H/W coordinates as target (reference reuses target's coord grid, no shift or multiplication).
+    2. **denoise_mask=0 on reference** — reference tokens always clean, never noised.
+    3. **Per-dimension RoPE phase rotation** — composed on top of standard RoPE for reference positions only. `rate(d) = theta^(-2d/L)`, `extra_angle(d) = source_id * phase_scale * rate(d)`, composed via `cos_new = cos*cos_extra - sin*sin_extra`, `sin_new = cos*sin_extra + sin*cos_extra`. Applied to first `ref_len` positions of self-attention frequencies. Cross-attention frequencies untouched. Target tokens (source_id=0) get perfect no-op.
+- **Internal composition (six mechanisms wrapped in one node):**
+    1. VAE encoding of reference image with target aspect matching
+    2. YuNet DNN face detection (falls through to MediaPipe/Haar if unavailable; auto-downloads ~350KB ONNX model to `~/.cache/10s_comfy/`)
+    3. Auto face crop with configurable zoom_factor (default 2.0)
+    4. Reference-to-reference alignment (secondary ref's face uniformly scaled/positioned to match primary's face bbox — eliminates aspect/proportion desync)
+    5. Reference token injection via `LTXReferenceEnable`'s patch machinery
+    6. Spatial mask gating with cosine falloff around detected face region
+- **v2 patch site:** `_patched_prepare_positional_embeddings` in `ltx_reference_enable.py` wraps `LTXBaseModel._prepare_positional_embeddings`. Reads `_pending_ref_seq_len`, `_pending_source_id`, `_pending_phase_scale` from the model instance and applies `_compose_source_phase` to `pe[0]` (self-attn frequencies only) for reference-token positions. Class-level patch found via MRO walk.
+- **pe structure LTX uses (split_rope path):**
+    ```
+    pe = [
+        (   # pe[0] — self-attn freqs for target+reference (T = ref_len + target_len)
+            (cos [1, H, T, D_head_a], sin [1, H, T, D_head_a], split=True),  # first half
+            (cos [1, H, T, D_head_b], sin [1, H, T, D_head_b], split=True),  # second half
+        ),
+        (   # pe[1] — cross-attn freqs (context, T=193 typical) — DO NOT modify
+            ...
+        ),
+    ]
+    ```
+- **Default config:** `identity_strength=1.0, face_padding=0.15, auto_face_crop=True, crop_zoom_factor=2.0, spatial_gating=mask_soft, placement_mode=i2v_safe, source_id=2.0, phase_scale=1.0`
+- **Best-Face-ID compatible values:** `source_id=2.0, phase_scale=1.0` (LoRA-trained defaults). Changing these will break the LoRA's learned response.
+- **Full-image mode:** `auto_face_crop=False` + `spatial_gating=off` — reference encodes entire image, useful as i2v stabilizer/scene anchor rather than face identity tool.
+- **Supersedes:** LikenessAnchor node for face identity workflows. LikenessGuide still valid for conditioning-level identity (different mechanism).
+- **Credit:** Best-Face-ID technique and LoRA by Alissonerdx (https://huggingface.co/Alissonerdx/LTX-Best-Face-ID)
+
 ### 🔗 LTX Reference Enable / 🎴 LTX Reference Conditioning / 🚫 LTX Reference Bypass / 🔎 LTX Reference Probe
 - **Files:** `ltx_reference_enable.py`, `ltx_reference_conditioning.py`
 - **Category:** `10S Nodes/LTX2` (Bypass also here; Probe in `Debug`)
@@ -196,6 +231,29 @@ Reference's `(H, W)` latent dims must exactly equal target's `(H, W)` latent dim
 JoyAI's native pipeline zeros reference timesteps to mark them as clean (σ=0). Mathematically this should be correct — the model has explicit support for clean reference tokens. Empirically on Echo's released T2V-only checkpoint, zeroing causes severe distortion (color inversion, broken identity).
 
 Theory: Echo's training distribution didn't include σ=0 reference tokens. The released weights have no learned behavior for that configuration. AdaLN modulation with t=0 produces affine transforms that wreck attention to the reference tokens. Default OFF works better in practice. The toggle remains as `zero_ref_timesteps` on LTX Reference Enable for future i2v-trained checkpoints where this may flip.
+
+---
+
+
+### Finding 14: Best-Face-ID's overlap layout requires per-dim phase rotation for i2v use
+
+Best-Face-ID's default "overlap" placement mode puts reference tokens at identical raw T/H/W coordinates as target tokens. During most of denoising this is fine because target is noisy while reference is clean (`denoise_mask=0`), giving attention a distinguishing signal. But near end of sampling target reaches clean state too — at which point two clean tokens sit at the identical coordinate with no positional distinction.
+
+The mechanism providing disambiguation is a **per-rotary-dimension phase rotation composed on top of RoPE**, angle depending only on `source_id`. For `source_id=0` (target), the rotation is a no-op (base model behavior preserved). For `source_id=2` (Best-Face-ID reference), reference tokens rotate into a distinct phase band that attention can separate from target regardless of noise state.
+
+**Implementation constraints:**
+- Must apply the rotation to `pe[0]` (self-attn frequencies) only. `pe[1]` (cross-attn, context→visual) untouched.
+- LTX uses split_rope path — pe[0] is a tuple of two `(cos, sin, split_flag)` tuples for the split halves. Rotation must apply to BOTH halves.
+- Frequency schedule: `rate(d) = theta ** (-2d / L)` matching LTX's own RoPE convention (theta=10000).
+- Composition via complex multiplication: `cos_new = cos*cos_extra - sin*sin_extra`, `sin_new = cos*sin_extra + sin*cos_extra`.
+- Applied to first `ref_len` sequence positions only.
+
+Without the phase rotation (v1 overlap-only): identity blends into target late in sampling. With it (v2): clean separation throughout, i2v conditioning coexists cleanly.
+
+**Wrong approaches tried before landing on the correct one:**
+- Additive coordinate shift for reference tokens (`coord -= max_t + 1`) — pushes tokens outside training distribution
+- Multiplicative coordinate scaling (`coord *= (1 + source_id * phase_scale)`) — same problem, different flavor
+- Both of these operate at the coord level, but the actual mechanism operates at the RoPE-output level per rotary dimension.
 
 ---
 

@@ -475,14 +475,297 @@ class LTXReferenceBypass:
         return (model,)
 
 
+class LTXReferenceSequenceConditioning:
+    """Encode a sequence of frames as a multi-frame reference latent.
+
+    Like LTX Reference Conditioning but accepts a multi-frame IMAGE
+    input (a video frame sequence) and uses a chosen N-frame window
+    as the reference. Multi-frame reference can provide richer identity
+    and motion context than a single still image — useful for matching
+    subjects in motion or capturing temporal style cues.
+
+    The default num_frames=9 matches LTX2's temporal compression of 8
+    (1 + 8k pattern → 2 latent temporal positions). Other values are
+    allowed; the VAE will produce whatever latent F dim its temporal
+    compression yields.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "vae": ("VAE",),
+                "images": ("IMAGE", {
+                    "tooltip": "Multi-frame IMAGE input (a video frame "
+                               "sequence). Use a Load Video, image batch, "
+                               "or upstream frame producer.",
+                }),
+            },
+            "optional": {
+                "target_latent": ("LATENT", {
+                    "tooltip": "Optional. Wire the same LATENT going to "
+                               "your sampler. Frames will be resized in "
+                               "pixel space to match this latent's spatial "
+                               "dims before VAE encoding.",
+                }),
+                "start_frame": ("INT", {
+                    "default": 0, "min": 0, "max": 240, "step": 1,
+                    "tooltip": "Which frame in the input sequence to start "
+                               "the reference window at. Frames before this "
+                               "are discarded.",
+                }),
+                "num_frames": ("INT", {
+                    "default": 9, "min": 1, "max": 25, "step": 1,
+                    "tooltip": "How many frames from start_frame to use as "
+                               "reference. Default 9 (1 + 8k matches LTX2 "
+                               "temporal compression — gives ~2 latent "
+                               "frames). 17, 25 also valid for more "
+                               "temporal context at higher cost.",
+                }),
+                "strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Scales the reference latent magnitude. "
+                               "0.0 bypasses and clears state.",
+                }),
+                "position_mode": (["reference", "prefix_continuous"], {
+                    "default": "reference",
+                    "tooltip": "'reference': memory positions overlap target's "
+                               "first frames. 'prefix_continuous': memory "
+                               "positions precede target temporally.",
+                }),
+                "verbose": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Print detailed per-call info to the console.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "attach"
+    CATEGORY = "10S Nodes/LTX2"
+    DESCRIPTION = (
+        "Multi-frame variant of LTX Reference Conditioning. Takes a "
+        "frame-sequence IMAGE input and uses a chosen N-frame window "
+        "as reference. Multi-frame reference can capture motion and "
+        "temporal style that single-image reference can't."
+    )
+
+    def attach(self, model, vae, images, target_latent=None,
+               start_frame=0, num_frames=9, strength=1.0,
+               position_mode="reference", verbose=False):
+        # Bypass + clear state
+        if strength == 0.0:
+            print("[LTX Reference Sequence] strength=0, bypassing and clearing state.")
+            model = model.clone()
+            if hasattr(model, "model_options") and isinstance(model.model_options, dict):
+                to = model.model_options.get("transformer_options")
+                if isinstance(to, dict):
+                    to.pop("reference_latent", None)
+                    to.pop("reference_position_mode", None)
+                    to.pop("memory_video", None)
+                    to.pop("memory_position_mode", None)
+            try:
+                dm = model.model.diffusion_model
+                for attr in ("_ltx_reference_latent", "_echo_memory_video"):
+                    if hasattr(dm, attr):
+                        delattr(dm, attr)
+            except Exception:
+                pass
+            return (model,)
+
+        # Validate input shape
+        if images.dim() != 4:
+            raise ValueError(
+                f"[LTX Reference Sequence] Expected IMAGE shape (B, H, W, C), "
+                f"got {tuple(images.shape)}"
+            )
+
+        # Strip alpha channel if present
+        if images.shape[-1] > 3:
+            images = images[..., :3]
+
+        # Frame window slicing
+        total_frames = int(images.shape[0])
+        actual_start = max(0, min(start_frame, total_frames - 1))
+        actual_end = min(actual_start + num_frames, total_frames)
+        sequence = images[actual_start:actual_end]
+        actual_count = int(sequence.shape[0])
+
+        if actual_count < 1:
+            raise ValueError(
+                f"[LTX Reference Sequence] No frames after slicing "
+                f"(start={actual_start}, end={actual_end}, "
+                f"total_frames={total_frames})"
+            )
+
+        if verbose:
+            print(f"[LTX Reference Sequence] Using frames "
+                  f"[{actual_start}:{actual_end}] ({actual_count} frames) "
+                  f"from input of {total_frames} total")
+
+        # Pixel-space resize via target_latent (same as single-image path)
+        if target_latent is not None:
+            try:
+                tl = target_latent
+                if isinstance(tl, dict):
+                    tl = tl.get("samples", tl)
+                if isinstance(tl, torch.Tensor) and tl.dim() == 5:
+                    H_lat = int(tl.shape[3])
+                    W_lat = int(tl.shape[4])
+                    target_H_px = H_lat * 32
+                    target_W_px = W_lat * 32
+
+                    seq_H = int(sequence.shape[1])
+                    seq_W = int(sequence.shape[2])
+
+                    if (seq_H, seq_W) != (target_H_px, target_W_px):
+                        seq_chw = sequence.permute(0, 3, 1, 2).contiguous()
+                        seq_chw = F.interpolate(
+                            seq_chw, size=(target_H_px, target_W_px),
+                            mode='bilinear', align_corners=False, antialias=True
+                        )
+                        sequence = seq_chw.permute(0, 2, 3, 1).contiguous()
+                        if verbose:
+                            print(
+                                f"[LTX Reference Sequence] Resized frames "
+                                f"from {seq_H}x{seq_W} → "
+                                f"{target_H_px}x{target_W_px}"
+                            )
+                else:
+                    print(
+                        f"[LTX Reference Sequence] WARN: target_latent shape "
+                        f"unexpected (got {type(tl).__name__}). Using "
+                        f"frames as-is."
+                    )
+            except Exception as e:
+                print(
+                    f"[LTX Reference Sequence] WARN: couldn't use "
+                    f"target_latent for resize: {type(e).__name__}: {e}"
+                )
+
+        # Pad spatial to multiples of 32 (VAE downscale)
+        sequence = _pad_image_to_multiple(sequence, divisor=32)
+
+        # VAE encode the multi-frame sequence.
+        # Comfy's VAE wrapper for LTX2 treats the batch dim of IMAGE as
+        # the temporal dim for video VAEs. Passing (N, H, W, C) should
+        # produce a video-encoded latent (1, C, F_latent, H, W) where
+        # F_latent depends on temporal compression (8 for LTX2 VAE).
+        try:
+            encoded = vae.encode(sequence)
+        except Exception as e:
+            raise RuntimeError(
+                f"[LTX Reference Sequence] VAE encode failed for sequence "
+                f"shape {tuple(sequence.shape)}: {type(e).__name__}: {e}"
+            )
+
+        # Normalize encoded shape to (1, C, F, H, W)
+        if isinstance(encoded, dict):
+            encoded = encoded.get("samples", encoded)
+
+        if not isinstance(encoded, torch.Tensor):
+            raise RuntimeError(
+                f"[LTX Reference Sequence] VAE returned non-tensor: "
+                f"{type(encoded).__name__}"
+            )
+
+        if encoded.dim() == 5:
+            # (B, C, F, H, W) — already video format
+            reference_latent = encoded.contiguous()
+        elif encoded.dim() == 4:
+            # (B, C, H, W) — N independent images, each 1 latent frame.
+            # Stack along F dim: (B=N, C, H, W) → (1, C, N, H, W)
+            reference_latent = encoded.unsqueeze(0).transpose(1, 2).contiguous()
+            if verbose:
+                print(
+                    f"[LTX Reference Sequence] VAE returned 4D — "
+                    f"stacking N={encoded.shape[0]} as F dim"
+                )
+        else:
+            raise RuntimeError(
+                f"[LTX Reference Sequence] VAE returned unexpected shape: "
+                f"{tuple(encoded.shape)}"
+            )
+
+        if verbose:
+            print(
+                f"[LTX Reference Sequence] Encoded latent shape: "
+                f"{tuple(reference_latent.shape)} (B, C, F, H, W)"
+            )
+
+        # process_latent_in normalization (critical — without this,
+        # raw VAE output causes color artifacts in injection)
+        try:
+            base_model = model.model
+            if hasattr(base_model, "process_latent_in"):
+                ref_pre = (
+                    float(reference_latent.mean().item()),
+                    float(reference_latent.std().item()),
+                )
+                reference_latent = base_model.process_latent_in(reference_latent)
+                ref_post = (
+                    float(reference_latent.mean().item()),
+                    float(reference_latent.std().item()),
+                )
+                if verbose:
+                    print(
+                        f"[LTX Reference Sequence] Normalized latent: "
+                        f"mean {ref_pre[0]:.3f}→{ref_post[0]:.3f}, "
+                        f"std {ref_pre[1]:.3f}→{ref_post[1]:.3f}"
+                    )
+        except Exception as e:
+            print(
+                f"[LTX Reference Sequence] WARN: process_latent_in failed: "
+                f"{type(e).__name__}: {e}. Using raw VAE output."
+            )
+
+        # Apply strength scaling
+        if strength != 1.0:
+            reference_latent = reference_latent * strength
+
+        # Attach via dual channel (model_options + diffusion_model attribute)
+        model = model.clone()
+        if hasattr(model, "model_options") and isinstance(model.model_options, dict):
+            to = model.model_options.setdefault("transformer_options", {})
+            if isinstance(to, dict):
+                to["reference_latent"] = reference_latent
+                to["reference_position_mode"] = position_mode
+                # Backwards compat keys
+                to["memory_video"] = reference_latent
+                to["memory_position_mode"] = position_mode
+
+        try:
+            dm = model.model.diffusion_model
+            dm._ltx_reference_latent = reference_latent
+            dm._echo_memory_video = reference_latent
+        except Exception as e:
+            print(
+                f"[LTX Reference Sequence] WARN: couldn't set attribute "
+                f"side-channel: {e}"
+            )
+
+        if verbose:
+            print(
+                f"[LTX Reference Sequence] Attached: "
+                f"shape={tuple(reference_latent.shape)}, "
+                f"mode={position_mode}, strength={strength}"
+            )
+
+        return (model,)
+
+
 NODE_CLASS_MAPPINGS = {
     "LTXReferenceConditioning": LTXReferenceConditioning,
+    "LTXReferenceSequenceConditioning": LTXReferenceSequenceConditioning,
     "LTXReferenceProbe": LTXReferenceProbe,
     "LTXReferenceBypass": LTXReferenceBypass,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXReferenceConditioning": "\U0001f3b4 LTX Reference Conditioning",
+    "LTXReferenceSequenceConditioning": "\U0001f3ac LTX Reference Sequence",
     "LTXReferenceProbe": "\U0001f50e LTX Reference Probe",
     "LTXReferenceBypass": "\U0001f6ab LTX Reference Bypass",
 }

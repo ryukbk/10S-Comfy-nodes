@@ -29,6 +29,35 @@ No external dependencies beyond ComfyUI's existing environment.
 
 ## Nodes
 
+### LTX Face Identity Reinforcer
+
+**Category:** `10S Nodes/Identity`
+
+Single-node identity reinforcer that makes the [LTX-Best-Face-ID LoRA](https://huggingface.co/Alissonerdx/LTX-Best-Face-ID) by Alissonerdx work correctly with i2v conditioning. Originally the LoRA was T2V-only because its reference-latent injection at frame 0's RoPE grid competed with i2v's own frame 0 latent conditioning. This node implements the full mechanism from the creator's spec: overlap-layout reference token injection with a per-rotary-dimension phase rotation composed on top of RoPE, providing positional disambiguation between reference and target tokens without spatial collision.
+
+Composes six mechanisms internally so the user sees one node:
+- VAE encoding of the reference image
+- YuNet face detection with auto-crop and padding
+- Reference-to-reference alignment (secondary reference's face is scaled/positioned to match the primary's face bbox, eliminating aspect/proportion desync)
+- Reference token injection at overlap coordinates (same T/H/W as target)
+- Per-dimension RoPE phase rotation for reference positions (`source_id=2, phase_scale=1.0` matching Best-Face-ID's trained convention)
+- Spatial mask gating with cosine falloff around the detected face region
+
+**Wiring:**
+
+```
+Load Model → Load Best-Face-ID LoRA → LTX Face Identity Reinforcer → Sampler
+                                              ↑
+                                    VAE, reference_image, target_latent
+                                    (reference_image_2 optional)
+```
+
+**Use case:** identity-consistent i2v generation. The reference face influences generation across all frames while i2v conditioning controls composition. Works with a single face reference (identity anchor) or with a second reference for additional identity signal (different angle, expression, or lighting of the same subject).
+
+**Optional full-image mode:** with `auto_face_crop=False`, the entire reference image gets encoded rather than just a face-centered crop. Repurposes the tool as a general i2v stabilizer — reference tokens carry the full scene, providing lighting/composition anchoring throughout the temporal sequence instead of only at frame 0.
+
+Credit for the underlying Best-Face-ID technique and LoRA: [Alissonerdx](https://huggingface.co/Alissonerdx/LTX-Best-Face-ID).
+
 ### LTX Reference Enable / Conditioning / Bypass / Probe
 
 **Category:** `10S Nodes/LTX2` (Probe in `10S Nodes/Debug`)
@@ -132,6 +161,18 @@ Builds a memory bank entry for the `ComfyUI_JoyAI_Echo` package's native pipelin
 
 ## Workflow Patterns
 
+### Best-Face-ID i2v identity (recommended for face reference workflows)
+
+```
+Load Model → Load Best-Face-ID LoRA → LTX Face Identity Reinforcer → KSampler
+                                              ↑
+                                    VAE, reference_image, target_latent
+```
+
+Replaces the LikenessAnchor pattern for face-identity workflows. The reinforcer node handles VAE encoding, face detection, reference alignment, phase rotation, and spatial gating internally. Single-node drop-in.
+
+For full-scene i2v stabilization (non-face use case), set `auto_face_crop=False` and `spatial_gating=off` — reference then acts as a general scene anchor across the temporal sequence.
+
 ### Identity-preserved generation with reference injection
 
 ```
@@ -192,6 +233,13 @@ Reference tokens (sequence-input intervention) and latent anchors (mid-forward a
 ---
 
 ## Version History
+
+**v1.9.4** — LTX Face Identity Reinforcer (Best-Face-ID i2v integration)
+- Added LTXFaceIdentityReinforcer — single-node identity reinforcer for the LTX-Best-Face-ID LoRA
+- Full mechanism implementation per creator's spec: overlap coordinate placement + per-dimension RoPE phase rotation
+- Makes Best-Face-ID work with i2v (previously T2V-only)
+- Composes VAE encoding, YuNet face detection, reference alignment, phase rotation, and spatial gating into one node
+- Extended `ltx_reference_enable.py` with `_prepare_positional_embeddings` wrapper implementing source phase composition
 
 **v1.9.0** — LTX Reference Token Injection
 - Added LTX Reference Enable, Conditioning, Bypass, Probe
