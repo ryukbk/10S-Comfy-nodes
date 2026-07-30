@@ -54,6 +54,11 @@ _PATCH_ERROR: Optional[str] = None
 _CALL_COUNTER = 0
 _VERBOSE = False  # Set True for debug logging
 
+# ── Strata layout constants (backported from Best-Face-ID reference impl) ───
+STRATA_SLOT_WIDTH = 1.5     # seconds between strata slots on T axis
+                            # Changed 2026-07-18 from 0.5 to 1.5 (fixed slot0/1 collision)
+
+
 
 def _log(msg: str):
     if _VERBOSE:
@@ -71,20 +76,16 @@ def _import_comfy():
 # ── v2: Best-Face-ID source phase rotation ─────────────────────────────────
 
 _ORIGINAL_PREPARE_PE = None
+_V2_DEBUG_DONE = False   # set to True after first hook run to reduce log spam
+_V2_STRATA_DONE = False  # set to True after first multi-ref segment build
+_V2_MULTIREF_DONE = False  # set to True after first multi-ref phase-active print
 
 
 def _compose_source_phase(cos_orig, sin_orig, ref_len, source_id, phase_scale, theta=10000.0):
     """
-    Apply Best-Face-ID's source phase rotation to reference token positions only.
-
-    Per creator's spec:
-      rate(d) = theta ** (-2d / L)                     (per rotary dim d, L=D_head)
-      extra_angle(d) = source_id * phase_scale * rate(d)
-      cos_new = cos_orig * cos_extra - sin_orig * sin_extra
-      sin_new = cos_orig * sin_extra + sin_orig * cos_extra
-    Only for ref positions along T axis; target positions untouched.
-
-    cos_orig, sin_orig: (B, H, T, D_head)
+    Apply source phase rotation to legacy 4-dim (B,H,T,D_head) cos/sin tensors.
+    Kept for backward compatibility.  Newer ComfyUI packs cos+sin+split into
+    one 6-dim tensor — see _rotate_packed_freq_tensor for that path.
     """
     if ref_len <= 0 or source_id == 0.0 or phase_scale == 0.0:
         return cos_orig, sin_orig
@@ -95,8 +96,6 @@ def _compose_source_phase(cos_orig, sin_orig, ref_len, source_id, phase_scale, t
     if ref_len > T:
         ref_len = T
 
-    # Frequency schedule matching RoPE convention.
-    # Interleaved RoPE pairs adjacent dims (2i, 2i+1) sharing a rate.
     n_pairs = D // 2
     pair_idx = torch.arange(n_pairs, device=device, dtype=torch.float32)
     rate_per_pair = theta ** (-2.0 * pair_idx / D)
@@ -122,63 +121,406 @@ def _compose_source_phase(cos_orig, sin_orig, ref_len, source_id, phase_scale, t
     return cos_out, sin_out
 
 
+def _rotate_packed_freq_tensor(freq_tensor, ref_len, source_id, phase_scale, theta=10000.0):
+    """
+    Rotate a packed frequency tensor of shape (B, T, H, D_head, 2, 2) where
+    the last two dims form a 2x2 rotation matrix per (position, head, dim).
+
+    Composition via element-wise cos/sin arithmetic on the last two dims
+    treated as [cos/sin_idx, split_half_idx].  Mathematically equivalent to
+    matrix multiplication of the 2x2 rotation but matches the pre-regression
+    working form the LoRA responds strongly to.
+
+    Uses theta^(-2d/L) frequency schedule (standard RoPE, adjacent dim pairs).
+
+    Only the first ref_len positions along T (dim 1) get rotated.
+    Target positions bit-identical to input (source_id=0 => identity matrix).
+    """
+    if ref_len <= 0 or source_id == 0.0 or phase_scale == 0.0:
+        return freq_tensor
+    if freq_tensor.dim() != 6:
+        return freq_tensor
+
+    B, T, H, D, two_a, two_b = freq_tensor.shape
+    if two_a != 2 or two_b != 2:
+        return freq_tensor
+    if ref_len > T:
+        ref_len = T
+
+    device = freq_tensor.device
+    dtype  = freq_tensor.dtype
+
+    # Frequency schedule per rotary dim — Best-Face-ID convention: theta^(-d/L)
+    # Single d exponent (NOT 2d/L). Adjacent dim pairs (2i, 2i+1) share a rate.
+    n_pairs = D // 2
+    pair_idx = torch.arange(n_pairs, device=device, dtype=torch.float32)
+    rate_per_pair = theta ** (-2.0 * pair_idx / D)         # standard RoPE (was -d/D)
+    rate = rate_per_pair.repeat_interleave(2)
+    if D % 2 == 1:
+        rate = torch.cat([rate, rate_per_pair[-1:].expand(1)], dim=0)
+
+    # Extra rotation angle per dim
+    extra_angle = source_id * phase_scale * rate            # (D,)
+    ce = extra_angle.cos().to(dtype=dtype)                  # (D,)
+    se = extra_angle.sin().to(dtype=dtype)                  # (D,)
+
+    # Broadcast for element-wise composition (working pre-regression form).
+    # Interpret last-two dims as [cos/sin_idx, split_half_idx] and rotate.
+    ce_b = ce.view(1, 1, 1, D, 1)
+    se_b = se.view(1, 1, 1, D, 1)
+
+    ref_slice = freq_tensor[:, :ref_len]                    # (B, ref_len, H, D, 2, 2)
+    cos_ref = ref_slice[..., 0, :]                          # (B, ref_len, H, D, 2)
+    sin_ref = ref_slice[..., 1, :]                          # (B, ref_len, H, D, 2)
+
+    cos_new = cos_ref * ce_b - sin_ref * se_b
+    sin_new = cos_ref * se_b + sin_ref * ce_b
+
+    ref_rotated = torch.stack([cos_new, sin_new], dim=-2)   # (B, ref_len, H, D, 2, 2)
+
+    result = freq_tensor.clone()
+    result[:, :ref_len] = ref_rotated
+    return result
+
+
+def _rotate_freq_tuple(freq_tuple, ref_len, source_id, phase_scale, theta):
+    """Dispatch to correct rotation based on tensor layout."""
+    if not isinstance(freq_tuple, tuple) or len(freq_tuple) < 2:
+        return freq_tuple
+
+    first = freq_tuple[0]
+    if not hasattr(first, "shape"):
+        return freq_tuple
+
+
+    if first.dim() == 6 and first.shape[-1] == 2 and first.shape[-2] == 2:
+        rotated = _rotate_packed_freq_tensor(
+            first, ref_len, source_id, phase_scale, theta
+        )
+        extras = freq_tuple[1:] if len(freq_tuple) > 1 else ()
+        return (rotated, *extras)
+
+    if first.dim() == 4 and len(freq_tuple) >= 2 and hasattr(freq_tuple[1], "shape"):
+        cos_new, sin_new = _compose_source_phase(
+            first, freq_tuple[1], ref_len, source_id, phase_scale, theta
+        )
+        extras = freq_tuple[2:] if len(freq_tuple) > 2 else ()
+        return (cos_new, sin_new, *extras)
+
+    return freq_tuple
+
+
+
+def _apply_multi_source_phase_to_pe(pe, segments, phase_scale, theta=10000.0):
+    """
+    Apply per-segment phase rotation for stacked references.
+
+    Args:
+      segments: list of (start_pos, length, source_id) tuples
+      phase_scale: shared magnitude scaler
+      theta: RoPE base frequency
+
+    Each segment gets its own source_id → distinct phase band. Prevents the
+    "fading crossover" behavior when multiple references occupy overlap
+    coordinates.
+    """
+    if not (isinstance(pe, (list, tuple)) and len(pe) >= 1):
+        return pe
+
+    # For each segment, apply _apply_source_phase_to_pe with that segment's
+    # ref_len and source_id. Since our source-phase functions currently only
+    # support "first N positions" slicing, we compose by working on a copy
+    # for each segment individually.
+    result_pe = pe
+    for seg in segments:
+        # Segment tuple may be (start, length, source_id) or (start, length, source_id, slot_idx)
+        start_pos = seg[0]
+        length = seg[1]
+        seg_source_id = seg[2]
+        if length <= 0 or seg_source_id == 0.0:
+            continue
+        # Apply rotation to positions [start_pos : start_pos+length]
+        # We do this by temporarily working with a virtual "shifted" pe where
+        # the segment appears at position 0, rotate first `length` positions,
+        # then merge back. For simplicity we currently only handle segments
+        # starting at 0 correctly; segments starting later would need slicing
+        # support. Since our concatenation is [ref0, ref1, target...], only
+        # ref0 starts at 0. For ref1+ we need offset-aware rotation.
+        result_pe = _apply_source_phase_to_pe_ranged(
+            result_pe, start_pos, length, seg_source_id, phase_scale, theta
+        )
+    return result_pe
+
+
+def _apply_source_phase_to_pe_ranged(pe, start, length, source_id, phase_scale, theta):
+    """Apply rotation to a specific position range [start, start+length]."""
+    if length <= 0 or source_id == 0.0 or phase_scale == 0.0:
+        return pe
+    if not (isinstance(pe, (list, tuple)) and len(pe) >= 1):
+        return pe
+
+    def rotate_video_selfattn(v_pe):
+        if not isinstance(v_pe, tuple) or len(v_pe) < 2:
+            return v_pe
+        first = v_pe[0]
+        if not hasattr(first, "shape"):
+            new_halves = []
+            for half in v_pe:
+                new_halves.append(_rotate_freq_tuple_ranged(
+                    half, start, length, source_id, phase_scale, theta))
+            return tuple(new_halves)
+        return _rotate_freq_tuple_ranged(v_pe, start, length, source_id, phase_scale, theta)
+
+    pe_video_group = pe[0]
+    if (isinstance(pe_video_group, tuple) and len(pe_video_group) == 2
+            and (isinstance(pe_video_group[0], tuple) or
+                 (isinstance(pe_video_group[0], tuple) and len(pe_video_group[0]) >= 2))):
+        v_pe_orig, av_cross_v = pe_video_group[0], pe_video_group[1]
+        v_pe_new = rotate_video_selfattn(v_pe_orig)
+        new_pe0 = (v_pe_new, av_cross_v)
+    else:
+        new_pe0 = rotate_video_selfattn(pe_video_group)
+
+    if isinstance(pe, list):
+        return [new_pe0] + list(pe[1:])
+    return (new_pe0,) + tuple(pe[1:])
+
+
+def _rotate_freq_tuple_ranged(freq_tuple, start, length, source_id, phase_scale, theta):
+    """Range-aware version of _rotate_freq_tuple for per-segment rotation."""
+    if not isinstance(freq_tuple, tuple) or len(freq_tuple) < 2:
+        return freq_tuple
+    first = freq_tuple[0]
+    if not hasattr(first, "shape"):
+        return freq_tuple
+
+    if first.dim() == 6 and first.shape[-1] == 2 and first.shape[-2] == 2:
+        rotated = _rotate_packed_freq_tensor_ranged(
+            first, start, length, source_id, phase_scale, theta
+        )
+        extras = freq_tuple[1:] if len(freq_tuple) > 1 else ()
+        return (rotated, *extras)
+
+    if first.dim() == 4 and len(freq_tuple) >= 2 and hasattr(freq_tuple[1], "shape"):
+        # Legacy 4-dim path: only supports first-N; for arbitrary range we need
+        # to slice differently. Simple approach: rotate the full range as-if.
+        cos_new, sin_new = _compose_source_phase_ranged(
+            first, freq_tuple[1], start, length, source_id, phase_scale, theta
+        )
+        extras = freq_tuple[2:] if len(freq_tuple) > 2 else ()
+        return (cos_new, sin_new, *extras)
+    return freq_tuple
+
+
+def _rotate_packed_freq_tensor_ranged(freq_tensor, start, length, source_id, phase_scale, theta=10000.0):
+    """Range-aware rotation of packed 6-dim freq tensor."""
+    if length <= 0 or source_id == 0.0 or phase_scale == 0.0:
+        return freq_tensor
+    if freq_tensor.dim() != 6:
+        return freq_tensor
+
+    B, T, H, D, two_a, two_b = freq_tensor.shape
+    if two_a != 2 or two_b != 2:
+        return freq_tensor
+    end = min(T, start + length)
+    if end <= start:
+        return freq_tensor
+
+    device = freq_tensor.device
+    dtype  = freq_tensor.dtype
+
+    n_pairs = D // 2
+    pair_idx = torch.arange(n_pairs, device=device, dtype=torch.float32)
+    rate_per_pair = theta ** (-2.0 * pair_idx / D)
+    rate = rate_per_pair.repeat_interleave(2)
+    if D % 2 == 1:
+        rate = torch.cat([rate, rate_per_pair[-1:].expand(1)], dim=0)
+
+    extra_angle = source_id * phase_scale * rate
+    ce = extra_angle.cos().to(dtype=dtype)
+    se = extra_angle.sin().to(dtype=dtype)
+
+    ce_b = ce.view(1, 1, 1, D, 1)
+    se_b = se.view(1, 1, 1, D, 1)
+
+    ref_slice = freq_tensor[:, start:end]
+    cos_ref = ref_slice[..., 0, :]
+    sin_ref = ref_slice[..., 1, :]
+    cos_new = cos_ref * ce_b - sin_ref * se_b
+    sin_new = cos_ref * se_b + sin_ref * ce_b
+    ref_rotated = torch.stack([cos_new, sin_new], dim=-2)
+
+    result = freq_tensor.clone()
+    result[:, start:end] = ref_rotated
+    return result
+
+
+def _compose_source_phase_ranged(cos_orig, sin_orig, start, length,
+                                    source_id, phase_scale, theta=10000.0):
+    """Legacy 4-dim path: range-aware rotation."""
+    if length <= 0 or source_id == 0.0 or phase_scale == 0.0:
+        return cos_orig, sin_orig
+    B, H, T, D = cos_orig.shape
+    end = min(T, start + length)
+    if end <= start:
+        return cos_orig, sin_orig
+    device = cos_orig.device
+    dtype  = cos_orig.dtype
+
+    n_pairs = D // 2
+    pair_idx = torch.arange(n_pairs, device=device, dtype=torch.float32)
+    rate_per_pair = theta ** (-2.0 * pair_idx / D)
+    rate = rate_per_pair.repeat_interleave(2)
+    if D % 2 == 1:
+        rate = torch.cat([rate, rate_per_pair[-1:].expand(1)], dim=0)
+
+    extra_angle = source_id * phase_scale * rate
+    cos_extra = extra_angle.cos().to(dtype=dtype).view(1, 1, 1, D)
+    sin_extra = extra_angle.sin().to(dtype=dtype).view(1, 1, 1, D)
+
+    cos_ref = cos_orig[:, :, start:end, :]
+    sin_ref = sin_orig[:, :, start:end, :]
+    cos_new_ref = cos_ref * cos_extra - sin_ref * sin_extra
+    sin_new_ref = cos_ref * sin_extra + sin_ref * cos_extra
+
+    cos_out = cos_orig.clone()
+    sin_out = sin_orig.clone()
+    cos_out[:, :, start:end, :] = cos_new_ref
+    sin_out[:, :, start:end, :] = sin_new_ref
+    return cos_out, sin_out
+
+
 def _apply_source_phase_to_pe(pe, ref_len, source_id, phase_scale, theta=10000.0):
     """
-    Walk pe structure and apply _compose_source_phase to self-attn frequencies
-    only (pe[0]).  Cross-attn (pe[1]) untouched.
+    Walk pe structure and apply phase rotation to video self-attn frequencies.
 
-    Expected structure:
+    Post-update AV pe structure (LTXAVModel._prepare_positional_embeddings):
       pe = [
-          ( (cos, sin, split), (cos, sin, split) ),   # pe[0] self-attn split halves
-          ( (cos, sin, split), ... ),                  # pe[1] cross-attn (context)
+          (v_pe, av_cross_video_freq_cis),   # pe[0]: video path
+          (a_pe, av_cross_audio_freq_cis),   # pe[1]: audio path
       ]
+    Where v_pe and a_pe themselves are outputs of _precompute_freqs_cis and
+    can be either:
+      - Nested tuple:  (freq_tuple_half_a, freq_tuple_half_b)  # split RoPE
+      - Direct tuple:  (cos, sin, split_flag)                  # non-split
+
+    We rotate the FIRST element of pe[0] (video self-attn = v_pe) only.
+    Audio self-attn (pe[1][0]) and AV cross-attn tensors are left untouched
+    since reference tokens are video-only.
     """
     if ref_len <= 0 or source_id == 0.0 or phase_scale == 0.0:
         return pe
     if not (isinstance(pe, (list, tuple)) and len(pe) >= 1):
         return pe
 
-    self_attn_freqs = pe[0]
-    if not isinstance(self_attn_freqs, (list, tuple)):
-        return pe
+    def rotate_video_selfattn(v_pe):
+        """Apply rotation to video self-attention frequencies."""
+        if not isinstance(v_pe, tuple) or len(v_pe) < 2:
+            return v_pe
 
-    new_self_attn = []
-    for freq_tuple in self_attn_freqs:
-        if not isinstance(freq_tuple, tuple) or len(freq_tuple) < 2:
-            new_self_attn.append(freq_tuple)
-            continue
-        cos_orig, sin_orig = freq_tuple[0], freq_tuple[1]
-        extras = freq_tuple[2:] if len(freq_tuple) > 2 else ()
-        if not (hasattr(cos_orig, "shape") and cos_orig.dim() == 4):
-            new_self_attn.append(freq_tuple)
-            continue
-        cos_new, sin_new = _compose_source_phase(
-            cos_orig, sin_orig, ref_len, source_id, phase_scale, theta
-        )
-        new_self_attn.append((cos_new, sin_new, *extras))
+        first = v_pe[0]
+        if not hasattr(first, "shape"):
+            # v_pe is a tuple of halves — iterate
+            new_halves = []
+            for half in v_pe:
+                new_halves.append(
+                    _rotate_freq_tuple(half, ref_len, source_id, phase_scale, theta)
+                )
+            return tuple(new_halves)
 
-    new_self_attn = tuple(new_self_attn)
-    if isinstance(pe, list):
-        new_pe = [new_self_attn] + list(pe[1:])
+        # v_pe[0] is a tensor — v_pe is directly a freq tuple, rotate as a whole
+        return _rotate_freq_tuple(v_pe, ref_len, source_id, phase_scale, theta)
+
+    # pe[0] is expected to be (v_pe, av_cross_video_freq_cis) tuple
+    pe_video_group = pe[0]
+    if not globals().get("_V2_STRUCTURE_LOGGED", False):
+        globals()["_V2_STRUCTURE_LOGGED"] = True
+        globals()["_V2_STRUCTURE_LOG_PRINTED"] = True
+
+    # Handle both old and new layouts within pe[0]:
+    if (isinstance(pe_video_group, tuple) and len(pe_video_group) == 2
+            and (isinstance(pe_video_group[0], tuple) or
+                 (isinstance(pe_video_group[0], tuple) and len(pe_video_group[0]) >= 2))):
+        # New AV layout: (v_pe, av_cross_video_freq_cis)
+        v_pe_orig, av_cross_v = pe_video_group[0], pe_video_group[1]
+        v_pe_new = rotate_video_selfattn(v_pe_orig)
+        new_pe0 = (v_pe_new, av_cross_v)
     else:
-        new_pe = (new_self_attn,) + tuple(pe[1:])
+        # Fallback: treat pe[0] as v_pe directly (legacy structure)
+        new_pe0 = rotate_video_selfattn(pe_video_group)
+
+    if isinstance(pe, list):
+        new_pe = [new_pe0] + list(pe[1:])
+    else:
+        new_pe = (new_pe0,) + tuple(pe[1:])
     return new_pe
 
 
 def _patched_prepare_positional_embeddings(self, pixel_coords, frame_rate, x_dtype):
-    """v2: wrap standard pe construction with reference-token phase rotation."""
+    """v2 + strata: wrap standard pe construction with reference-token phase
+    rotation and per-reference strata temporal offsets.
+
+    Multi-ref: applies per-segment source_id and per-segment temporal shift
+    if _pending_ref_segments is set. Each reference goes to its own strata
+    slot on the T axis, giving both positional and phase-band separation."""
     global _ORIGINAL_PREPARE_PE
-    pe = _ORIGINAL_PREPARE_PE(self, pixel_coords, frame_rate, x_dtype)
 
     ref_len     = int(getattr(self, "_pending_ref_seq_len", 0) or 0)
     source_id   = float(getattr(self, "_pending_source_id", 0.0) or 0.0)
     phase_scale = float(getattr(self, "_pending_phase_scale", 0.0) or 0.0)
     theta       = float(getattr(self, "positional_embedding_theta", 10000.0) or 10000.0)
+    segments    = getattr(self, "_pending_ref_segments", None)
 
-    if ref_len > 0 and source_id != 0.0 and phase_scale != 0.0:
-        pe = _apply_source_phase_to_pe(pe, ref_len, source_id, phase_scale, theta)
-        _log(f"v2 source phase applied: ref_len={ref_len} "
-             f"source_id={source_id} phase_scale={phase_scale} theta={theta}")
+    # Strata coord shift disabled — was hurting rather than helping.
+    # Overlap layout (all refs at same coords) with per-ref phase rotation
+    # was the previous working state.
+    pe = _ORIGINAL_PREPARE_PE(self, pixel_coords, frame_rate, x_dtype)
+
+    global _V2_DEBUG_DONE
+    _first_time = not _V2_DEBUG_DONE
+
+    # Multi-ref confirmation uses its own one-shot flag so it fires once
+    # per Python session regardless of prior single-ref runs.
+    global _V2_MULTIREF_DONE
+    _multi_ref_now = (segments is not None and len(segments) > 1
+                     and ref_len > 0 and phase_scale != 0.0)
+
+    if ref_len > 0 and phase_scale != 0.0:
+        # If all segments share the same source_id, use single flat rotation
+        # over the full ref_len range (matches pre-regression behavior).
+        if segments is not None and len(segments) > 1:
+            unique_source_ids = set(s[2] for s in segments)
+            if len(unique_source_ids) == 1:
+                # Uniform — collapse to single rotation over full ref range
+                uniform_sid = next(iter(unique_source_ids))
+                pe = _apply_source_phase_to_pe(pe, ref_len, uniform_sid, phase_scale, theta)
+                if not _V2_MULTIREF_DONE:
+                    _V2_MULTIREF_DONE = True
+                    _V2_DEBUG_DONE = True
+                    print(f"[LTX Ref] v2 phase active (multi-ref, uniform sid): "
+                          f"{len(segments)} refs, source_id={uniform_sid}, "
+                          f"ref_len={ref_len}, phase_scale={phase_scale}")
+            else:
+                # Distinct per-segment source_ids — use ranged multi-source path
+                pe = _apply_multi_source_phase_to_pe(pe, segments, phase_scale, theta)
+                if not _V2_MULTIREF_DONE:
+                    _V2_MULTIREF_DONE = True
+                    _V2_DEBUG_DONE = True
+                    print(f"[LTX Ref] v2 multi-source phase active: "
+                          f"{len(segments)} refs, source_ids="
+                          f"{[s[2] for s in segments]}, "
+                          f"phase_scale={phase_scale}")
+        elif source_id != 0.0:
+            # Single-ref: uniform rotation across all reference positions
+            pe = _apply_source_phase_to_pe(pe, ref_len, source_id, phase_scale, theta)
+            if _first_time:
+                _V2_DEBUG_DONE = True
+                print(f"[LTX Ref] v2 source phase active: ref_len={ref_len} "
+                      f"source_id={source_id} phase_scale={phase_scale} theta={theta}")
+    elif _first_time:
+        _V2_DEBUG_DONE = True
+        print(f"[LTX Ref] v2 idle (ref_len={ref_len}, source_id={source_id}, "
+              f"phase_scale={phase_scale})")
 
     return pe
 
@@ -240,8 +582,7 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
     self._pending_ref_seq_len = 0
     self._pending_source_id = 0.0
     self._pending_phase_scale = 0.0
-    self._pending_source_id = 0.0
-    self._pending_phase_scale = 0.0
+    self._pending_ref_segments = None
 
     if reference_latent is None:
         return result
@@ -398,8 +739,23 @@ def _patched_process_input(self, x, keyframe_idxs, denoise_mask, **kwargs):
     self._pending_source_id = source_id
     self._pending_phase_scale = phase_scale
     self._pending_ref_frames = ref_frames
-    self._pending_source_id = source_id
-    self._pending_phase_scale = phase_scale
+    # Per-reference segment tracking: each reference frame gets a distinct
+    # source_id (source_id, source_id+1, source_id+2, ...) so multiple stacked
+    # references don't collapse into an averaged blend.
+    # Backported from Best-Face-ID phase overlap reference (per-ref seg_value).
+    if ref_frames > 1:
+        # UNIFORM source_id for all references — Best-Face-ID LoRA was trained
+        # single-ref, so per-ref source_ids move ref2 into an untrained
+        # response region.  Uniform makes the LoRA fire identically on both.
+        self._pending_ref_segments = [(i * spatial, spatial, source_id, i)
+                                      for i in range(ref_frames)]
+        global _V2_STRATA_DONE
+        if not _V2_STRATA_DONE:
+            _V2_STRATA_DONE = True
+            print(f"[LTX Ref] Multi-ref: {ref_frames} refs × {spatial} tokens each, "
+                  f"all at source_id={source_id} (uniform)")
+    else:
+        self._pending_ref_segments = None    # single ref uses uniform source_id
 
     _log(f"Prepending {ref_seq_len} ref tokens "
          f"(target was {target_seq_len}, now {vx_combined.shape[1]}, "
@@ -723,19 +1079,35 @@ def apply_global_patches():
         LTXAVModel._process_input = _patched_process_input
         LTXAVModel._prepare_timestep = _patched_prepare_timestep
 
-        # v2: wrap _prepare_positional_embeddings on whichever base class owns it
+        # v2: patch _prepare_positional_embeddings on LTXAVModel itself.
+        # Prior code walked MRO to find first owner, but if LTXAVModel overrides
+        # the base class version, MRO-walk landed on a stale target that was
+        # shadowed at runtime. Patch LTXAVModel directly to catch the actual
+        # runtime call regardless of where the method is defined higher up.
         global _ORIGINAL_PREPARE_PE
-        _pe_owner = None
-        for cls in LTXAVModel.__mro__:
-            if '_prepare_positional_embeddings' in cls.__dict__:
-                _pe_owner = cls
-                break
-        if _pe_owner is not None:
-            _ORIGINAL_PREPARE_PE = _pe_owner._prepare_positional_embeddings
-            _pe_owner._prepare_positional_embeddings = _patched_prepare_positional_embeddings
-            print(f"[LTX Ref] v2 patched _prepare_positional_embeddings on {_pe_owner.__name__}")
+
+        # Preserve the actual method that will be shadowed by our patch.
+        # If LTXAVModel has its own override, capture that. Otherwise walk
+        # MRO to find the inherited version.
+        if '_prepare_positional_embeddings' in LTXAVModel.__dict__:
+            _ORIGINAL_PREPARE_PE = LTXAVModel.__dict__['_prepare_positional_embeddings']
+            _pe_source = LTXAVModel.__name__
         else:
-            print("[LTX Ref] ⚠ could not find _prepare_positional_embeddings owner")
+            # Not overridden on LTXAVModel — find inherited version to preserve
+            _pe_source = None
+            for cls in LTXAVModel.__mro__[1:]:
+                if '_prepare_positional_embeddings' in cls.__dict__:
+                    _ORIGINAL_PREPARE_PE = cls.__dict__['_prepare_positional_embeddings']
+                    _pe_source = cls.__name__
+                    break
+
+        if _ORIGINAL_PREPARE_PE is not None:
+            # Always install patch on LTXAVModel itself so it wins the MRO race
+            LTXAVModel._prepare_positional_embeddings = _patched_prepare_positional_embeddings
+            print(f"[LTX Ref] v2 patched _prepare_positional_embeddings on LTXAVModel "
+                  f"(preserving original from {_pe_source})")
+        else:
+            print("[LTX Ref] ⚠ could not find _prepare_positional_embeddings anywhere in MRO")
 
         _PATCHES_APPLIED = True
         _PATCH_ERROR = None
